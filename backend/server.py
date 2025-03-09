@@ -1,194 +1,209 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from flask_jwt_extended import (
-    JWTManager, create_access_token,
-    jwt_required, get_jwt_identity
-)
 import subprocess
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-import sqlite3
-import bcrypt
+from datetime import datetime
 from io import BytesIO
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
 import socket
 import ipaddress
+import json
+import time
+import threading
 
 app = Flask(__name__)
 CORS(app)
 
-# JWT Configuration
-app.config["JWT_SECRET_KEY"] = "super-secret-key-change-in-production"
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)
-jwt = JWTManager(app)
-
+# Enhanced Vulnerability Database
 VULNERABILITY_DB = {
     "smb-vuln-ms17-010": {
         "name": "EternalBlue (SMBv1)",
         "severity": 10,
         "remediation": "1. Disable SMBv1\n2. Apply MS17-010 patch",
         "attack_simulation": "Ransomware deployment via SMBv1",
-        "category": "Windows"
+        "category": "Windows",
+        "cve": "CVE-2017-0144",
+        "mitre_tactics": ["TA0001", "TA0002"]
     },
     "http-vuln-cve2021-42013": {
         "name": "Apache Path Traversal",
         "severity": 9,
         "remediation": "Upgrade Apache to 2.4.51+",
         "attack_simulation": "Sensitive file disclosure",
-        "category": "Web"
+        "category": "Web",
+        "cve": "CVE-2021-42013",
+        "mitre_tactics": ["TA0003", "TA0007"]
     }
 }
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  email TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL)''')
-    conn.commit()
-    conn.close()
+# Compliance Checklists
+COMPLIANCE_FRAMEWORKS = {
+    "PCI_DSS": {
+        "requirements": [
+            "Install and maintain firewall",
+            "Protect stored cardholder data",
+            "Encrypt transmission of cardholder data",
+            "Use antivirus software",
+            "Restrict physical access to data"
+        ],
+        "passing_score": 4
+    },
+    "HIPAA": {
+        "requirements": [
+            "Risk analysis implementation",
+            "Workstation security",
+            "Access control implementation",
+            "Audit controls",
+            "Transmission security"
+        ],
+        "passing_score": 4
+    }
+}
 
-init_db()
+# Scan Status Tracking
+active_scans = {}
 
-def hash_password(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+def generate_attack_graph(results):
+    nodes = []
+    links = []
+    
+    for idx, host in enumerate(results['results']):
+        nodes.append({
+            "id": host['ip'],
+            "label": f"Host {host['ip']}",
+            "group": "host",
+            "value": len(host['vulnerabilities'])
+        })
+        
+        for vuln in host['vulnerabilities']:
+            vuln_id = f"{host['ip']}_{vuln['name']}"
+            nodes.append({
+                "id": vuln_id,
+                "label": vuln['name'],
+                "group": "vulnerability",
+                "severity": vuln['severity']
+            })
+            links.append({
+                "from": host['ip'],
+                "to": vuln_id,
+                "label": "CONTAINS"
+            })
+            
+            if "exploited" in vuln:
+                nodes.append({
+                    "id": f"{vuln_id}_exploit",
+                    "label": "Exploited",
+                    "group": "exploit"
+                })
+                links.append({
+                    "from": vuln_id,
+                    "to": f"{vuln_id}_exploit",
+                    "label": "EXPLOITED"
+                })
+    
+    return {"nodes": nodes, "links": links}
 
-def verify_password(password, hashed):
-    return bcrypt.checkpw(password.encode('utf-8'), hashed)
-
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.json
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return jsonify({"msg": "Missing email or password"}), 400
-
+def scan_worker(target, scan_id):
     try:
-        conn = sqlite3.connect('users.db')
-        c = conn.cursor()
-        c.execute("INSERT INTO users (email, password_hash) VALUES (?, ?)",
-                 (email, hash_password(password)))
-        conn.commit()
-        return jsonify({"msg": "User created"}), 201
-    except sqlite3.IntegrityError:
-        return jsonify({"msg": "Email already exists"}), 400
-    finally:
-        conn.close()
-
-@app.route('/login', methods=['POST'])
-def login():
-    data = request.json
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return jsonify({"msg": "Missing email or password"}), 400
-
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE email = ?", (email,))
-    user = c.fetchone()
-    conn.close()
-
-    if user and verify_password(password, user[0]):
-        access_token = create_access_token(identity=email)
-        return jsonify(access_token=access_token), 200
-
-    return jsonify({"msg": "Invalid credentials"}), 401
-
-def resolve_target(target):
-    try:
-        if '-' in target:
-            base, end = target.split('-')
-            base_parts = base.split('.')
-            return [str(ip) for ip in ipaddress.IPv4Network(f"{base}/24")][:int(end)+1]
-        elif not target.replace('.', '').isdigit():
-            return [socket.gethostbyname(target)]
-        return [target]
-    except Exception as e:
-        return []
-
-def parse_nmap_xml(xml_data):
-    root = ET.fromstring(xml_data)
-    results = {'open_ports': [], 'vulnerabilities': []}
-    
-    for host in root.findall('host'):
-        for port in host.findall('.//port'):
-            port_id = port.get('portid')
-            state = port.find('state').get('state')
-            if state == 'open':
-                results['open_ports'].append(int(port_id))
-                for script in port.findall('.//script'):
-                    script_id = script.get('id')
-                    if 'VULNERABLE' in script.get('output', ''):
-                        vuln = VULNERABILITY_DB.get(script_id, {})
-                        results['vulnerabilities'].append({
-                            **vuln,
-                            "port": port_id
-                        })
-    return results
-
-@app.route('/scan', methods=['POST'])
-@jwt_required()
-def scan():
-    data = request.json
-    target = data.get('target', '127.0.0.1')
-    duration = data.get('duration', 5)
-    
-    targets = resolve_target(target)
-    all_results = []
-    
-    for ip in targets:
-        try:
+        targets = resolve_target(target)
+        results = []
+        
+        for ip in targets:
             command = [
                 'nmap', '-T4', '-Pn',
-                '-p', '80,443,445,22',
+                '-p', '80,443,445,22,3389',
                 '--script', 'smb-vuln-*,http-vuln-*,ssh-vuln-*',
                 '-oX', '-',
                 ip
             ]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=duration*60)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=300)
             
-            if result.returncode != 0:
-                continue
+            if result.returncode == 0:
+                parsed = parse_nmap_xml(result.stdout)
+                parsed['ip'] = ip
+                parsed['timestamp'] = datetime.now().isoformat()
                 
-            parsed = parse_nmap_xml(result.stdout)
-            parsed['ip'] = ip
-            parsed['timestamp'] = datetime.now().isoformat()
-            all_results.append(parsed)
-            
-        except Exception as e:
-            continue
+                # Simulate exploit
+                if "smb-vuln-ms17-010" in [v['id'] for v in parsed['vulnerabilities']]:
+                    parsed['exploit'] = {
+                        "status": "success",
+                        "payload": "EternalBlue",
+                        "impact": "SYSTEM_ACCESS"
+                    }
+                
+                results.append(parsed)
+        
+        compliance = {}
+        for framework in COMPLIANCE_FRAMEWORKS:
+            passed = sum(1 for req in COMPLIANCE_FRAMEWORKS[framework]['requirements'] if check_compliance(req))
+            compliance[framework] = {
+                "passed": passed,
+                "total": len(COMPLIANCE_FRAMEWORKS[framework]['requirements']),
+                "status": "Pass" if passed >= COMPLIANCE_FRAMEWORKS[framework]['passing_score'] else "Fail"
+            }
+        
+        active_scans[scan_id] = {
+            "status": "completed",
+            "results": results,
+            "attack_graph": generate_attack_graph({"results": results}),
+            "compliance": compliance,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        active_scans[scan_id] = {
+            "status": "failed",
+            "error": str(e)
+        }
 
-    return jsonify({"target": target, "results": all_results})
+@app.route('/scan', methods=['POST'])
+def start_scan():
+    data = request.json
+    scan_id = f"scan_{int(time.time())}"
+    
+    active_scans[scan_id] = {"status": "running", "progress": 0}
+    thread = threading.Thread(target=scan_worker, args=(data.get('target', ''), scan_id))
+    thread.start()
+    
+    return jsonify({"scan_id": scan_id})
+
+@app.route('/scan-status/<scan_id>')
+def get_scan_status(scan_id):
+    return jsonify(active_scans.get(scan_id, {"status": "unknown"}))
 
 @app.route('/report', methods=['POST'])
-@jwt_required()
 def generate_report():
     data = request.json
     buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=letter)
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
     
-    p.setFont("Helvetica-Bold", 16)
-    p.drawString(100, 750, "LogicBreach Red Team Report")
-    p.drawString(100, 730, f"Target: {data['target']}")
+    # Header
+    story.append(Paragraph("LogicBreach Security Report", styles['Title']))
+    story.append(Spacer(1, 12))
     
-    y = 700
-    p.setFont("Helvetica", 12)
-    for result in data['results']:
-        for vuln in result['vulnerabilities']:
-            p.drawString(100, y, f"IP: {result['ip']} | {vuln['name']}")
-            p.drawString(100, y-20, f"Severity: {vuln['severity']}/10")
-            y -= 40
+    # Executive Summary
+    story.append(Paragraph("Executive Summary", styles['Heading2']))
+    story.append(Paragraph(f"""
+        <b>Scan Date:</b> {datetime.now().strftime('%Y-%m-%d')}<br/>
+        <b>Target:</b> {data['target']}<br/>
+        <b>Total Vulnerabilities:</b> {sum(len(h['vulnerabilities']) for h in data['results'])}<br/>
+        <b>Critical Findings:</b> {sum(1 for h in data['results'] for v in h['vulnerabilities'] if v['severity'] >= 9)}
+    """, styles['Normal']))
     
-    p.save()
+    # Compliance Status
+    story.append(Paragraph("Compliance Status", styles['Heading2']))
+    for framework in data.get('compliance', {}):
+        status = data['compliance'][framework]
+        story.append(Paragraph(f"""
+            <b>{framework}:</b> {status['passed']}/{status['total']} ({status['status']})
+        """, styles['Normal']))
+    
+    doc.build(story)
     buffer.seek(0)
     return send_file(buffer, mimetype='application/pdf')
 
 if __name__ == '__main__':
-    app.run(port=3001)
+    app.run(port=3001, threaded=True)
